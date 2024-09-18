@@ -10,6 +10,8 @@ import requests
 import os
 import concurrent.futures
 import plistlib
+import threading
+import time
 from flask import Flask, request, jsonify, redirect, url_for
 from urllib.parse import urlparse
 from time import sleep
@@ -25,10 +27,11 @@ from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from pymobiledevice3.services.mobile_image_mounter import auto_mount_personalized
 from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
 from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import DvtSecureSocketProxyService
-from pymobiledevice3.tunneld import get_tunneld_devices, TUNNELD_DEFAULT_ADDRESS, TunneldRunner
-
+from pymobiledevice3.tunneld import get_tunneld_devices, TUNNELD_DEFAULT_ADDRESS, TunneldRunner, TunnelTask
+from pymobiledevice3.remote.remotexpc import RemoteXPCConnection
 from pymobiledevice3._version import __version__ as pymd_ver
 
+from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 
 app = Flask("JITStreamer")
 logging.basicConfig(level=logging.WARNING)
@@ -54,12 +57,12 @@ if not config.has_section('Settings'):
 
 if not config.has_section('Tunnel'):
     config.add_section('Tunnel')
-    config.set('Tunnel', 'start-tunneld', 'true')
-    config.set('Tunnel', 'mobdev2', 'true')
-    config.set('Tunnel', 'usb', 'true')
-    config.set('Tunnel', 'wifi', 'true')
+    config.set('Tunnel', 'start-tunneld', 'false')
+    config.set('Tunnel', 'mobdev2', 'false')
+    config.set('Tunnel', 'usb', 'false')
+    config.set('Tunnel', 'wifi', 'false')
     config.set('Tunnel', 'usbmuxd', 'true')
-    config.set('Tunnel', 'start-tunnel-on-every-rq', 'true')
+    config.set('Tunnel', 'start-tunnel-on-every-rq', 'false')
 
 # Save the default configuration back to the file if it's newly created
 with open(config_path, 'w') as configfile:
@@ -67,7 +70,9 @@ with open(config_path, 'w') as configfile:
 
 DEVS_FILE = os.path.join(config_folder, 'devices.json')
 
-devs = []
+devs : 'list[Device]' = []
+
+tunneldRunner : 'TunneldRunner | None' = None
 
 class App:
     __slots__ = ('name', 'bundle', 'pid')
@@ -87,7 +92,7 @@ class Device:
     __slots__ = ('handle', 'name', 'udid', 'apps')
 
     def __init__(self, handle, name: str, udid: str, apps: list[App]):
-        self.handle = handle
+        self.handle : 'RemoteServiceDiscoveryService' = handle
         self.name = name
         self.udid = udid
         self.apps = apps
@@ -111,19 +116,19 @@ class Device:
                                           environment={})
 
     def enable_jit(self, name: str):
-        apps = [a for a in self.apps if a.name == name or a.bundle == name]
-        if len(apps) == 0:
-            return f"Could not find {name!r}!"
-        app = apps[0]
+        # apps = [a for a in self.apps if a.name == name or a.bundle == name]
+        # if len(apps) == 0:
+        #     return f"Could not find {name!r}!"
+        # app = apps[0]
 
-        if app.pid > 0 and app.pid == self.launch_app(app.bundle):
-            return f"JIT already enabled for {name!r}!"
+        # if app.pid > 0 and app.pid == self.launch_app(app.bundle):
+        #     return f"JIT already enabled for {name!r}!"
 
         debugserver = \
         (host, port) = \
         self.handle.service.address[0], self.handle.get_service_port('com.apple.internal.dt.remote.debugproxy')
 
-        app.pid = self.launch_app(app.bundle, True)
+        app.pid = self.launch_app(name, True)
 
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         logging.info(f"Connecting to [{host}]:{port}")
@@ -165,12 +170,12 @@ def save_devs():
 
 def load_devs():
     global devs
-    try:
-        with open(DEVS_FILE, 'r') as f:
-            devs_data = json.load(f)
-            devs = [Device(None, d['name'], d['udid'], [App(a['name'], a['bundle'], a['pid']) for a in d['apps']]) for d in devs_data]
-    except FileNotFoundError:
-        devs = []
+    # try:
+    #     with open(DEVS_FILE, 'r') as f:
+    #         devs_data = json.load(f)
+    #         devs = [Device(None, d['name'], d['udid'], [App(a['name'], a['bundle'], a['pid']) for a in d['apps']]) for d in devs_data]
+    # except FileNotFoundError:
+    #     devs = []
 
 def mount_device(dev):
     if dev is None:
@@ -188,7 +193,7 @@ def mount_device(dev):
         logging.error(f"Error mounting device {dev}: {e}")
         return None
 
-def refresh_devs():
+def refresh_devs(targetUdid: 'str | None' = None):
     global devs
     tunneld_devices = get_tunneld_devices()
     
@@ -198,6 +203,7 @@ def refresh_devs():
 
     with app.app_context():
         # Use ThreadPoolExecutor to handle device mounting in parallel
+        devs.clear()
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(mount_device, dev) for dev in tunneld_devices if dev is not None]
 
@@ -206,14 +212,9 @@ def refresh_devs():
                 dev = future.result()  # Get the device after it's mounted
                 if dev is not None:
                     try:
-                        # Check if device already exists in the list
-                        db_device = next((d for d in devs if d.udid == dev.udid), None)
-                        
-                        if not db_device:
-                            # Add new device
-                            new_device = Device(dev, dev.name, dev.udid, [])
-                            new_device.refresh_apps()
-                            devs.append(new_device)
+                        new_device = Device(dev, dev.name, dev.udid, [])
+                        # new_device.refresh_apps()
+                        devs.append(new_device)
                     except Exception as e:
                         logging.error(f"Error while processing device {dev}: {e}")
                 else:
@@ -296,28 +297,43 @@ def refresh_device_apps(device_id):
 
 @app.route('/<device_id>/<action>/', methods=['GET'])
 def perform_action(device_id, action):
-    device = get_device(device_id)
+    global tunneldRunner
     ip = request.remote_addr
     udid = device_id
-    start_tunneld_ip(ip, device_id)
-    if device:
-        result = device.enable_jit(action)
-        return jsonify(result)
-    else:
-        ip = request.remote_addr
-        udid = device_id
+    try:
+        start = time.time()
+        print("Starting Tunnel")
         start_tunneld_ip(ip, udid)
+
+        print("Refreshing Devices")
+        refresh_devs()
         device = get_device(device_id)
+
         if device:
+            print("Enabling JIT")
             result = device.enable_jit(action)
+            end = time.time()
+            print(f"Enabling JIT cost {round(end - start, 2)}s")
             return jsonify(result)
         return jsonify({"ERROR": "Device not found!"}), 404
+    except Exception as e:
+        print(e)
+    finally:
+        for tunnelId in tunneldRunner._tunneld_core.tunnel_tasks:
+            tunnelTask = tunneldRunner._tunneld_core.tunnel_tasks[tunnelId]
+            if tunnelTask.udid == udid:
+                tunnelTask.task.cancel()
+                del tunneldRunner._tunneld_core.tunnel_tasks[tunnelId]
+                break
+        
             
     
 
 def start_tunneld_proc():
-    TunneldRunner.create("0.0.0.0", TUNNELD_DEFAULT_ADDRESS[1],
-                         protocol=TunnelProtocol('quic'), mobdev2_monitor=tunnelsettings("mobdev2"), usb_monitor=tunnelsettings("usb"), wifi_monitor=tunnelsettings("wifi"), usbmux_monitor=tunnelsettings("usbmuxd"))
+    global tunneldRunner
+    tunneldRunner = TunneldRunner("0.0.0.0", TUNNELD_DEFAULT_ADDRESS[1],
+                         protocol=TunnelProtocol('quic'), mobdev2_monitor=False, usb_monitor=False, wifi_monitor=False, usbmux_monitor=True)
+    tunneldRunner._run_app()
                          
 @app.route('/uploads/', methods=['GET', 'POST'])
 def upload_file():
@@ -378,7 +394,7 @@ def upload_file():
             file_root, file_extension = os.path.splitext(filename)
         
             ip = request.remote_addr
-            start_tunneld_ip(ip, file_root)
+            # start_tunneld_ip(ip, file_root)
             return jsonify({"OK": f"File uploaded"}), 200
     
     return '''
@@ -395,7 +411,7 @@ def start_tunneld_ip(ip, udid):
     tunnel_url = f"http://127.0.0.1:{TUNNELD_DEFAULT_ADDRESS[1]}/start-tunnel?ip={ip}&udid={udid}&connection_type=usbmux-tcp"
     try:
         response = requests.get(tunnel_url)
-        refresh_devs()
+        # refresh_devs()
     except:
         print('Unable to add tunnel')
 
@@ -441,10 +457,10 @@ def start_server(verbose, timeout, pair, version):
     logging.getLogger().setLevel(log_levels[verbosity_level])
 
     if tunnelsettings("start-tunneld"):
-        tunneld = multiprocessing.Process(target=start_tunneld_proc)
+        tunneld = threading.Thread(target=start_tunneld_proc)
         tunneld.start()
         sleep(timeout)
-        refresh_devs()
+        # refresh_devs()
         
     try:
         # Try to convert to integer
