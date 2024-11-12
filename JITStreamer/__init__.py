@@ -131,7 +131,7 @@ class Device:
         app.pid = self.launch_app(name, True)
 
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        logging.info(f"Connecting to [{host}]:{port}")
+        print(f"Connecting to [{host}]:{port}")
         s.connect(debugserver)
 
         s.sendall(b'$QStartNoAckMode#b0')
@@ -196,6 +196,7 @@ def mount_device(dev):
 def refresh_devs(targetUdid: 'str | None' = None):
     global devs
     tunneld_devices = get_tunneld_devices()
+    print("returned from get_tunneld_devices")
     
     if not tunneld_devices:
         logging.warning("No devices returned from get_tunneld_devices().")
@@ -296,24 +297,50 @@ def refresh_device_apps(device_id):
     return jsonify({"ERROR": "Device not found!"}), 404
 
 @app.route('/<device_id>/<action>/', methods=['GET'])
-def perform_action(device_id, action):
+async def perform_action(device_id, action):
     global tunneldRunner
     ip = request.remote_addr
     udid = device_id
     try:
         start = time.time()
         print("Starting Tunnel")
-        start_tunneld_ip(ip, udid)
+        
+        res1 = None
+        tryCreateTunnel = 0
+        while res1 is None or res1.startswith("Started heartbeat") or res1.startswith('{"error":'):
+            tryCreateTunnel += 1
+            try:
+                res1 = start_tunneld_ip(ip, udid)
+            except e:
+                if tryCreateTunnel < 10:
+                    print(f"Failed, try again {tryCreateTunnel}")
+                    sleep(0.5)
+                else:
+                    raise e
+            
+        print("Connecting to Device")
+        tunnelInfo = json.loads(res1)
+        rsd = RemoteServiceDiscoveryService((tunnelInfo['address'], tunnelInfo['port']), name=f'usbmux-tcp-{udid}')
+        for i in range(0,10):
+            fut = rsd.connect()
+            try:
+                await asyncio.wait_for(fut, timeout=0.5)
+                break
+            except asyncio.TimeoutError:
+                print(f"Timeout, retry {i}")
+                if i < 10:
+                    continue
+                else:
+                    raise Exception("Device connect timed out")
+        print("Device connected")
 
-        print("Refreshing Devices")
-        refresh_devs()
-        device = get_device(device_id)
+        device : 'Device' = Device(handle=rsd, name='device', udid='udid', apps=[])
 
         if device:
             print("Enabling JIT")
             result = device.enable_jit(action)
             end = time.time()
-            print(f"Enabling JIT cost {round(end - start, 2)}s")
+            print(f"JIT enabled in {round(end - start, 2)}s")
             return jsonify(result)
         return jsonify({"ERROR": "Device not found!"}), 404
     except Exception as e:
@@ -411,6 +438,7 @@ def start_tunneld_ip(ip, udid):
     tunnel_url = f"http://127.0.0.1:{TUNNELD_DEFAULT_ADDRESS[1]}/start-tunnel?ip={ip}&udid={udid}&connection_type=usbmux-tcp"
     try:
         response = requests.get(tunnel_url)
+        return response.text
         # refresh_devs()
     except:
         print('Unable to add tunnel')
