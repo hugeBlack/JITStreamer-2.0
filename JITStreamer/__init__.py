@@ -131,7 +131,6 @@ class Device:
         app.pid = self.launch_app(name, True)
 
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        print(f"Connecting to [{host}]:{port}")
         s.connect(debugserver)
 
         s.sendall(b'$QStartNoAckMode#b0')
@@ -314,7 +313,6 @@ async def perform_action(device_id, action):
             except e:
                 if tryCreateTunnel < 10:
                     print(f"Failed, try again {tryCreateTunnel}")
-                    sleep(0.5)
                 else:
                     raise e
             
@@ -324,7 +322,7 @@ async def perform_action(device_id, action):
         for i in range(0,10):
             fut = rsd.connect()
             try:
-                await asyncio.wait_for(fut, timeout=0.5)
+                await asyncio.wait_for(fut, timeout=1)
                 break
             except asyncio.TimeoutError:
                 print(f"Timeout, retry {i}")
